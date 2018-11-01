@@ -75,7 +75,7 @@ class IForestModel (
     val possibleMaxSamples =
       if ($(maxSamples) > 1.0) $(maxSamples) else ($(maxSamples) * numSamples)
     val bcastModel = dataset.sparkSession.sparkContext.broadcast(this)
-    // calculate anomaly score
+    // calculate anomaly score, UDF
     val scoreUDF = udf { (features: Vector) => {
       val normFactor = avgLength(possibleMaxSamples)
       val avgPathLength = bcastModel.value.calAvgPathLength(features)
@@ -84,6 +84,7 @@ class IForestModel (
     }
     // append a score column
     val scoreDataset = dataset.withColumn($(anomalyScoreCol), scoreUDF(col($(featuresCol))))
+
     // get threshold value
     val threshold = scoreDataset.stat.approxQuantile($(anomalyScoreCol),
       Array(1 - $(contamination)), 0)
@@ -381,6 +382,8 @@ class IForest (
     * @return A paired RDD, where key is the tree index, value is an array of data instances for training a iTree.
     */
   private[iforest] def splitData(dataset: Dataset[_]): RDD[(Int, Array[Vector])] = {
+
+    // 数据总条数
     numSamples = dataset.count()
     val fraction =
       if ($(maxSamples) > 1) $(maxSamples) / numSamples
@@ -388,6 +391,7 @@ class IForest (
 
     require(fraction <= 1.0, "The max samples must be less then total number of the input data")
 
+    // 采样总数
     possibleMaxSampels = (fraction * numSamples).toInt
 
     // use advanced apache common math3 random generator
@@ -396,62 +400,71 @@ class IForest (
     )
 
 
-    val rddPerTree = {
+    val rddPerTree: RDD[(Int, Array[Vector])] = {
 
-      // SampledIndices is a two-dimensional array, that generates sampling row indices in each iTree.
-      // E.g. [[1, 3, 6, 4], [6, 4, 2, 5]] indicates that the first tree has
-      // data consists of the 1, 3, 6, 4 row samples, the second tree has data
-      // consists of the 6, 4, 3, 5 row samples.
-      // if bootstrap is true, each array can stores the repeated row indices
-      // if false, each array contains different row indices, and each index is
-      // elected with the same probability using reservoir sample method.
-      // Note: sampleIndices will occupy about maxSamples * numTrees * 8
-      // byte memory in the driver.
+      /** 1. 生成100*256的样本 */
+      // SampledIndices是一个二维数组，可在每个iTree中生成采样行索引,
+      // 总共有numTrees行, 每行有possibleMaxSampels个元素。
+      // 例如。 [[1,3,6,4]，[6,4,2,5]]表示第一棵树有
+      // 数据由第1,3,6,4行样本组成，第二棵树有数据由第6,4,3,5行样本组成。
+      // 如果bootstrap为true，则每个数组都可以存储重复的行索引
+      // 如果为false，则每个数组包含不同的行索引，每个索引都是
+      // 使用储层样本方法以相同的概率选出。
+      // 注意：sampleIndices将占用大约maxSamples * numTrees * 8
+      // driver中的字节内存。
       val sampleIndices = if ($(bootstrap)) {
+        // 如果bootstrap为true，则每个数组都可以存储重复的行索引
         Array.tabulate($(numTrees)) { i =>
           Array.fill(possibleMaxSampels) {
             advancedRgn.nextLong(0, numSamples)
           }
         }
       } else {
+        // 如果为false，则每个数组包含不同的行索引，并且使用库样本方法以相同的概率选择每个索引。
         Array.tabulate($(numTrees)) { i =>
           reservoirSampleAndCount(Range.Long(0, numSamples, 1).iterator,
             possibleMaxSampels, rng.nextLong)._1
         }
       }
 
-      // rowInfo structure is a Map in which key is rowId identifying each data instance,
-      // and value is a SparseVector that indicating this data instance is sampled for training which iTrees.
-      // SparseVector is constructed by (numTrees, treeIdArray, numCopiesArray), where
-      //  - treeIdArray indicates that which tree this row data is trained on;
-      //  - numCopiesArray indicates how namy copies of this row data in the corresponding tree.
-      //
-      // E.g., Map{1 -> SparseVector(100, [1, 3, 5], [3, 6, 1])} means that there are 100
-      // trees to construct a forest, and 3 copies of 1st row data trained on the 1 tree,
-      // 6 copies trained on the 3rd tree and 1 copy trained on the 5th tree.
-      val rowInfo = sampleIndices.zipWithIndex.flatMap { case (indices: Array[Long], treeId: Int) =>
-        indices.map(rowIndex => (rowIndex, treeId))
+      /** 2. 将数据折叠压缩, 广播到每个Executor上 */
+      // rowInfo结构是一个Map，其中key是rowId，用于标识每个数据实例，
+      // 和value是一个SparseVector，表示此数据实例被采样以进行iTrees的训练。
+      // SparseVector由（numTrees，treeIdArray，numCopiesArray）构成，其中
+      // - treeIdArray指示此行数据在哪个树上进行训练;
+      // - numCopiesArray表示相应树中此行数据的副本数。  
+      // 例如，Map {1 - > SparseVector（100，[1,3,5]，[3,6,1]）}表示有100
+      // 构建森林的树木，以及在第1棵树上训练的3份第1行数据，
+      // 在第3棵树上训练6份，在第5棵树上训练1份。
+      // rowInfo: Map[rowId,（numTrees，treeIdArray，numCopiesArray)]
+      val rowInfo: Map[Long, Vector] = sampleIndices.zipWithIndex.flatMap {
+        case (indices: Array[Long], treeId: Int) =>
+          indices.map(rowIndex => (rowIndex, treeId))
       }.groupBy(_._1).mapValues(x => x.map(_._2)).map {
         case (rowIndex: Long, treeIdArray: Array[Int]) =>
           val treeIdWithNumCopies = treeIdArray.map(treeId => (treeId, 1.0))
-              .groupBy(_._1).map { case (treeId: Int, tmp: Array[Tuple2[Int, Double]]) =>
+            .groupBy(_._1).map { case (treeId: Int, tmp: Array[Tuple2[Int, Double]]) =>
             tmp.reduce((x, y) => (treeId, x._2 + y._2))
           }.toSeq
           (rowIndex, Vectors.sparse($(numTrees), treeIdWithNumCopies))
       }
 
+      // 将rowInfo广播到每个节点
       val broadRowInfo = dataset.sparkSession.sparkContext.broadcast(rowInfo)
 
-      // Firstly filter rows that contained in the rowInfo, i.e., the instances
-      // that are used to construct the forest.
-      // Then for each row, get the number of copies in each tree, copy this point
-      // to an array with corresponding tree id.
-      // Finally reduce by the tree id key.
+      /** 3. 对分布式数据集进行抽样 */
+      // 首先过滤rowInfo中包含的行，即实例用于构建森林的。
+      // 然后对于每一行，获取每棵树中的副本数量，复制此点到具有相应树ID的数组。
+      // 最后通过树id键聚合。
       dataset.select(col($(featuresCol))).rdd.map {
         case Row(point: Vector) => point
-      }.zipWithIndex().filter{ case (point: Vector, rowIndex: Long) =>
-        broadRowInfo.value.contains(rowIndex)
+      }.zipWithIndex().filter { // 结构(features: Vector, index: Long)
+        // 将采样数据留下
+        case (point: Vector, rowIndex: Long) =>
+          // broadRowInfo: Map[rowId,（numTrees，treeIdArray，numCopiesArray)]
+          broadRowInfo.value.contains(rowIndex)
       }.flatMap { case (point: Vector, rowIndex: Long) =>
+        // 复制副本
         val numCopiesInEachTree = broadRowInfo.value.get(rowIndex).get.asInstanceOf[SparseVector]
         numCopiesInEachTree.indices.zip(numCopiesInEachTree.values).map {
           case (treeId: Int, numCopies: Double) =>
@@ -459,6 +472,8 @@ class IForest (
         }
       }.reduceByKey((arr1, arr2) => arr1 ++ arr2)
     }
+
+    // 结构RDD[(Int, Array[Vector])], 有$numTrees 行数据
     rddPerTree
   }
 
@@ -474,15 +489,19 @@ class IForest (
   override def fit(dataset: Dataset[_]): IForestModel = {
     transformSchema(dataset.schema, logging = true)
 
-    val rddPerTree = splitData(dataset)
+    // 数据抽样, 行key是树索引，行value是树的一组采样数据实例。
+    val rddPerTree: RDD[(Int, Array[Vector])] = splitData(dataset)
 
     // add Instrumentation instance
+    // 包装工具类, 日志
     val instr = Instrumentation.create(this, rddPerTree)
     instr.logParams(numTrees, maxSamples, maxFeatures, maxDepth, contamination,
       bootstrap, seed, featuresCol, predictionCol, labelCol)
 
     // Each iTree of the iForest will be built on parallel and collected in the driver.
-    // Approximate memory usage for iForest model is calculated, a warning will be raised if iForest is too large.
+    // Approximate memory usage for iForest model is calculated,
+    // a warning will be raised if iForest is too large.
+    // int是32个bit, 这里为什么要*2 ?
     val usageMemery = $(numTrees) * 2 * possibleMaxSampels * 32 / (1024 * 1024)
     if (usageMemery > 256) {
       logger.warn("The isolation forest stored on the driver will exceed 256M memory. " +
@@ -581,6 +600,7 @@ class IForest (
     // 2. the number of data can not be splitted again
     // 3. there are no non-constant features to draw
     if (currentPathLength >= maxDepth || data.length <= 1) {
+      // 返回叶子节点
       new IFLeafNode(data.length)
     } else {
       val numFeatures = data.head.length
@@ -607,7 +627,10 @@ class IForest (
           findConstant = false
         }
       }
-      if (numFeatures == constantFeatureIndex) new IFLeafNode(data.length)
+      if (numFeatures == constantFeatureIndex) {
+        // 返回叶子节点
+        new IFLeafNode(data.length)
+      }
       else {
         // select randomly a feature value between (attrMin, attrMax)
         val attrValue = rng.nextDouble() * (attrMax - attrMin) + attrMin
@@ -615,6 +638,7 @@ class IForest (
         val leftData = data.filter(point => point(attrIndex) < attrValue)
         val rightData = data.filter(point => point(attrIndex) >= attrValue)
         // recursively build a tree
+        // 递归构造一个树
         new IFInternalNode(
           iTree(leftData, currentPathLength + 1, maxDepth, constantFeatures.clone()),
           iTree(rightData, currentPathLength + 1, maxDepth, constantFeatures.clone()),

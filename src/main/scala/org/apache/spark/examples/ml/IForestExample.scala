@@ -32,6 +32,7 @@ object IForestExample {
         .setInputCol("_c10")
         .setOutputCol("label")
 
+    // 特征转换器, 将多个输入列转化为一个features标识的向量
     val assembler = new VectorAssembler()
     assembler.setInputCols(Array("_c1", "_c2", "_c3", "_c4", "_c5", "_c6", "_c7", "_c8", "_c9"))
     assembler.setOutputCol("features")
@@ -48,6 +49,7 @@ object IForestExample {
     val model = pipeline.fit(dataset)
     val predictions = model.transform(dataset)
 
+    // 二元分类评估期, 评估prediction 与 label的差别
     val binaryMetrics = new BinaryClassificationMetrics(
       predictions.select("prediction", "label").rdd.map {
         case Row(label: Double, ground: Double) => (label, ground)
